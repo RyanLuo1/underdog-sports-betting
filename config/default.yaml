@@ -1,0 +1,21 @@
+# Thresholds, limits, and polling schedules. Values are placeholders until
+# shadow-mode results are in; see the spec's Execution and risk controls section.
+
+polling:
+  hot_window_seconds: 15
+  default_seconds: 120
+
+freshness:
+  max_post_age_s: 120
+  max_sharp_odds_age_s: 10
+  max_novig_book_age_s: 10
+  min_seconds_before_start: 60
+
+halts:
+  ingestor_heartbeat_s: 120
+  max_clock_drift_ms: 250
+
+min_edge:
+  news_speed: null
+  stale_after_sharp_move: null
+  second_order_prop: null
