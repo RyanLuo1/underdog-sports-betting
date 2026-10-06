@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Daily Novig trades backfill. Rendered and loaded by scripts/install_daily_jobs.sh. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.newsedge.novig-trades</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__UV__</string>
+        <string>run</string>
+        <string>python</string>
+        <string>scripts/backfill_novig_trades.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+    <!-- Novig publishes around 09:00 UTC. Two runs a day; each fills any missing day. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Hour</key><integer>16</integer><key>Minute</key><integer>30</integer></dict>
+    </array>
+    <key>StandardOutPath</key>
+    <string>__REPO__/logs/novig-trades.log</string>
+    <key>StandardErrorPath</key>
+    <string>__REPO__/logs/novig-trades.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

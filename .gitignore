@@ -227,6 +227,7 @@ __marimo__/
 *.key
 secrets/
 data/
+logs/
 
 # Private docs (strategy spec)
 docs/private/

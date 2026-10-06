@@ -22,6 +22,17 @@ uv run mypy
 uv run pytest
 ```
 
+## Novig trade history
+
+```sh
+uv run python scripts/backfill_novig_trades.py           # fill in any missing days
+uv run python scripts/backfill_novig_trades.py --verify  # also re-check files against Novig's MD5
+scripts/install_daily_jobs.sh                            # run it daily via launchd (4:30, 16:30)
+```
+
+Raw CSVs go to `data/novig/raw/`, Parquet to `data/novig/parquet/`, rows to `novig_trades`.
+Logs are in `logs/novig-trades.log`.
+
 ## Layout
 
 - `src/news_edge/`: `core`, `sources`, `classify`, `entities`, `market`, `pricing`,
