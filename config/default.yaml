@@ -32,3 +32,8 @@ recorder:
   max_markets_per_connection: 1800  # headroom under 2048 for markets that open later
   refresh_seconds: 300              # re-read the catalog and repack this often
   subscribe_batch: 16               # events per subscribe (16 tokens each, 512 burst, 4/s)
+
+# Nightly backup of the recorder's stream files (scripts/backup_novig_stream.py).
+# A folder at the top of iCloud Drive, outside the synced Desktop and Documents.
+backup:
+  dest: "~/Library/Mobile Documents/com~apple~CloudDocs/novig-backups"

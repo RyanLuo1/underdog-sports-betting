@@ -35,3 +35,11 @@ def test_secrets_are_masked(monkeypatch: pytest.MonkeyPatch) -> None:
     assert s.apify_token is not None
     assert "super-secret" not in repr(s)
     assert s.apify_token.get_secret_value() == "super-secret"
+
+
+def test_blank_env_values_fall_back_to_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "")
+    monkeypatch.setenv("APIFY_TOKEN", "")
+    s = Settings(_env_file=None)
+    assert s.database_url == Settings.model_fields["database_url"].default
+    assert s.apify_token is None

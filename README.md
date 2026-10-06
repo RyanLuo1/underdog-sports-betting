@@ -48,6 +48,15 @@ after a crash and keeps the Mac awake (`caffeinate -i -s`) while it runs. Raw me
 to `data/novig/stream/<env>/`, with every connect, disconnect, and seq gap in
 `connections.jsonl` there. Logs are in `logs/novig-recorder.log`.
 
+A nightly launchd job (03:00) archives each finished day of stream files to the
+`backup.dest` folder in `config/default.yaml`, verifies every archive, and logs disk usage
+to `logs/novig-backup.log`:
+
+```sh
+uv run python scripts/backup_novig_stream.py              # back up any finished day now
+uv run python scripts/backup_novig_stream.py --disk-only  # just the disk-usage line
+```
+
 ## Layout
 
 - `src/news_edge/`: `core`, `sources`, `classify`, `entities`, `market`, `pricing`,

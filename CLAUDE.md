@@ -57,14 +57,24 @@ launchd jobs (`scripts/install_daily_jobs.sh` installs every template in
 launchctl list | grep newsedge                                # loaded jobs, PID, last exit
 launchctl print gui/$(id -u)/com.newsedge.novig-recorder      # state and run count
 launchctl kickstart -k gui/$(id -u)/com.newsedge.novig-recorder   # restart, e.g. after editing .env
-tail -f logs/novig-recorder.log logs/novig-trades.log
+tail -f logs/novig-recorder.log logs/novig-trades.log logs/novig-backup.log
 uv run python scripts/run_novig_recorder.py --gaps            # windows with no stream data
+uv run python scripts/backup_novig_stream.py --disk-only      # disk usage line now
 ```
 
 - `com.newsedge.novig-trades`: trade-file backfill at 04:30 and 16:30 local.
 - `com.newsedge.novig-recorder`: order-book recorder, kept alive and run under
   `caffeinate -i -s`. It opens several connections (`recorder.connections` in
   `config/default.yaml`), since Novig caps each at 2048 markets.
+- `com.newsedge.novig-backup`: 03:00 local. Archives each finished UTC day of
+  `data/novig/stream/<env>/` to `backup.dest` in `config/default.yaml` (an iCloud Drive
+  folder outside Desktop and Documents), verifies each archive (opens, every file reads
+  back, names and sizes match), copies the gap log, and logs a disk-usage line. Verified
+  days are listed in `data/novig/stream/<env>/backups.json`. Local files are never
+  deleted.
+
+`scripts/install_daily_jobs.sh` leaves a loaded job alone when its plist is unchanged,
+so rerunning it does not restart the recorder.
 
 ## Conventions
 
@@ -99,11 +109,12 @@ As of 2026-10-06:
 
 - Built: Novig trade-file backfill (17.8M rows, Aug 4 to Oct 5), NOVIG-V3 signing,
   read key script, and the order-book recorder (4 connections, gap log).
-- Running: `novig-trades` (twice daily). `novig-recorder` is installed but exits until
-  `.env` has a read key.
+- Running: `novig-recorder` on Production (4 connections), `novig-trades` (twice
+  daily), `novig-backup` (nightly to iCloud Drive). Disk was 89% used (26 GiB free) on
+  Oct 6; watch the disk line in `logs/novig-backup.log`.
 - Next, in order (see the Plan section of `docs/private/spec.md`):
-  1. Recorder on Production by Sat Oct 10. The user creates the read key with
-     `scripts/create_read_key.py` and fills in `.env`.
+  1. Recorder on Production: running since Oct 6. Check its gap log after the first
+     NFL Sunday.
   2. Stage A as a research notebook in `src/news_edge/research/notebooks/`, not a
      service: @UnderdogNFL posts since Aug 4 (Apify backfill) joined to `novig_trades`.
      The method is in the spec, not here.
