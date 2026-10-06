@@ -131,3 +131,32 @@ def test_load_and_reload_are_idempotent(
     third = run(tmp_path, novig, db)
     assert third.loaded == [date(2026, 10, 5)]
     assert db.execute("SELECT count(*) FROM novig_trades").fetchone() == (6,)
+
+
+def test_deleted_raw_csv_is_not_downloaded_again(tmp_path: Path, novig: FakeNovig) -> None:
+    run(tmp_path, novig, conn=None)
+    (tmp_path / "raw/trades-2026-10-04.csv").unlink()  # backed up, then deleted locally
+
+    novig.requests.clear()
+    summary = run(tmp_path, novig, conn=None, verify=True)
+    assert summary.downloaded == summary.replaced == []
+    assert summary.failed == {}
+    assert novig.requests == ["/", "/reporting/trade-data/2026-10-05/trades.csv"]  # verify HEAD
+    assert not (tmp_path / "raw/trades-2026-10-04.csv").exists()
+
+
+@pytest.mark.db
+def test_deleted_raw_csv_loads_from_parquet(
+    tmp_path: Path, novig: FakeNovig, db: psycopg.Connection
+) -> None:
+    run(tmp_path, novig, conn=None)  # files only, nothing loaded yet
+    (tmp_path / "raw/trades-2026-10-04.csv").unlink()
+
+    novig.requests.clear()
+    summary = run(tmp_path, novig, db)
+    assert summary.loaded == [date(2026, 10, 4), date(2026, 10, 5)]
+    assert summary.downloaded == []
+    assert db.execute(
+        "SELECT size_bytes, row_count FROM novig_trade_files WHERE file_date = '2026-10-04'"
+    ).fetchone() == (0, 2)
+    assert run(tmp_path, novig, db).loaded == []

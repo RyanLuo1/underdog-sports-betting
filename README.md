@@ -55,7 +55,12 @@ to `logs/novig-backup.log`:
 ```sh
 uv run python scripts/backup_novig_stream.py              # back up any finished day now
 uv run python scripts/backup_novig_stream.py --disk-only  # just the disk-usage line
+uv run python scripts/backup_novig_raw.py                 # back up raw trade CSVs, verified
+uv run python scripts/backup_novig_raw.py --delete-verified  # then ask before deleting
 ```
+
+Below 20 GiB free disk the backup log says WARNING (CRITICAL below 10 GiB) and sends a
+macOS notification. The recorder stops cleanly below 5 GiB.
 
 ## Layout
 

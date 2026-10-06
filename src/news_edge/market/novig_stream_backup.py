@@ -2,8 +2,8 @@
 
 Each completed UTC day under data/novig/stream/<env>/<YYYY-MM-DD>/ becomes one archive,
 <dest>/<env>/<YYYY-MM-DD>.tar.gz. An archive is written as .part, verified (it opens,
-every member reads back and every gzipped member decompresses, and its file names and
-sizes match the source), and only then renamed. What each verified archive holds is
+every member reads back and every gzipped member decompresses, and its file names,
+sizes, and MD5s match the source), and only then renamed. What each verified archive holds is
 recorded in a local manifest (<env>/backups.json), so later runs compare the source
 against the manifest instead of reading archives back from iCloud, where macOS may
 have removed the local copy. A day whose source changed, or that has no verified
@@ -11,15 +11,18 @@ archive, is (re)written, so a missed night is caught up by the next run. The gap
 (connections.jsonl) is copied beside the archives. Nothing local is deleted.
 """
 
+import hashlib
 import json
 import logging
+import re
 import shutil
+import subprocess
 import tarfile
 import zlib
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import IO
+from typing import IO, Literal
 
 log = logging.getLogger(__name__)
 
@@ -59,29 +62,35 @@ def source_files(day_dir: Path) -> dict[str, int]:
     }
 
 
-def write_archive(day_dir: Path, dest: Path) -> None:
-    """Archive one day folder to dest, verify it, then rename it into place."""
-    expected = source_files(day_dir)
+def write_archive(
+    src_dir: Path, dest: Path, prefix: str, names: list[str] | None = None
+) -> dict[str, int]:
+    """Archive files from src_dir (all of them, or `names`) as <prefix>/<name>, verify
+    the archive against the source, then rename it into place. Returns name -> size."""
+    expected = source_files(src_dir)
+    if names is not None:
+        expected = {n: expected[n] for n in names}
     if not expected:
-        raise BackupError(f"{day_dir} has no files")
+        raise BackupError(f"{src_dir} has no files")
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_name(dest.name + ".part")
-    prefix = f"{day_dir.parent.name}/{day_dir.name}"
     with tarfile.open(part, "w:gz", compresslevel=6) as tar:
         for name in expected:
-            tar.add(day_dir / name, arcname=f"{prefix}/{name}", recursive=False)
+            tar.add(src_dir / name, arcname=f"{prefix}/{name}", recursive=False)
     try:
-        verify_archive(part, prefix, expected)
+        verify_archive(part, prefix, src_dir, list(expected))
     except Exception:
         part.unlink(missing_ok=True)
         raise
     part.replace(dest)
+    return expected
 
 
-def verify_archive(archive: Path, prefix: str, expected: dict[str, int]) -> None:
+def verify_archive(archive: Path, prefix: str, src_dir: Path, names: list[str]) -> None:
     """Raise BackupError unless the archive opens, every member reads back in full
-    (gzipped members decompress cleanly), and names and sizes match `expected`."""
-    found: dict[str, int] = {}
+    (gzipped members decompress cleanly), and its members are exactly `names`, each
+    with the same size and MD5 as the file in src_dir."""
+    found: dict[str, tuple[int, str]] = {}
     try:
         with tarfile.open(archive, "r:gz") as tar:
             for member in tar:
@@ -92,30 +101,43 @@ def verify_archive(archive: Path, prefix: str, expected: dict[str, int]) -> None
                 if f is None:
                     raise BackupError(f"{archive.name}: cannot read {member.name}")
                 with f:
-                    read = _read_member(f, gzipped=name.endswith(".gz"))
+                    read, md5 = _read_member(f, gzipped=name.endswith(".gz"))
                 if read != member.size:
                     raise BackupError(f"{archive.name}: {name} read {read} of {member.size}")
-                found[name] = member.size
+                found[name] = (read, md5)
     except (tarfile.TarError, OSError, EOFError, zlib.error) as exc:
         raise BackupError(f"{archive.name}: {type(exc).__name__}: {exc}") from exc
-    if found != expected:
-        missing = sorted(expected.keys() - found.keys())
-        extra = sorted(found.keys() - expected.keys())
-        changed = sorted(n for n in found.keys() & expected.keys() if found[n] != expected[n])
+    missing = sorted(set(names) - found.keys())
+    extra = sorted(found.keys() - set(names))
+    if missing or extra:
         raise BackupError(
-            f"{archive.name}: {len(found)} files vs {len(expected)} in source"
-            f" (missing {missing}, extra {extra}, size differs {changed})"
+            f"{archive.name}: {len(found)} files vs {len(names)} in source"
+            f" (missing {missing}, extra {extra})"
         )
+    for name in names:
+        path = src_dir / name
+        if found[name] != (path.stat().st_size, file_md5(path)):
+            raise BackupError(f"{archive.name}: {name} differs from the source")
 
 
-def _read_member(f: IO[bytes], gzipped: bool) -> int:
-    """Read a member to the end and return its byte count. A gzipped member is also
-    decompressed to the end, member by member, which checks every CRC."""
+def file_md5(path: Path) -> str:
+    md5 = hashlib.md5(usedforsecurity=False)
+    with path.open("rb") as f:
+        while chunk := f.read(_CHUNK):
+            md5.update(chunk)
+    return md5.hexdigest()
+
+
+def _read_member(f: IO[bytes], gzipped: bool) -> tuple[int, str]:
+    """Read a member to the end and return its byte count and MD5. A gzipped member is
+    also decompressed to the end, member by member, which checks every CRC."""
     count = 0
+    md5 = hashlib.md5(usedforsecurity=False)
     inflater = zlib.decompressobj(31)
     mid_member = False
     while chunk := f.read(_CHUNK):
         count += len(chunk)
+        md5.update(chunk)
         while gzipped and chunk:
             inflater.decompress(chunk)
             mid_member = True
@@ -127,7 +149,7 @@ def _read_member(f: IO[bytes], gzipped: bool) -> int:
                 chunk = b""
     if mid_member:
         raise BackupError("gzip member is truncated")
-    return count
+    return count, md5.hexdigest()
 
 
 def archive_present(dest: Path) -> bool:
@@ -163,8 +185,7 @@ def backup_env(env_dir: Path, dest_root: Path, today: date) -> BackupSummary:
                 continue
             if day_dir.name in manifest:
                 log.warning("%s: source changed since its backup; rewriting", label)
-            write_archive(day_dir, dest)
-            manifest[day_dir.name] = files
+            manifest[day_dir.name] = write_archive(day_dir, dest, f"{env_dir.name}/{day_dir.name}")
             write_manifest(manifest_path, manifest)
             log.info("%s: backed up and verified (%.1f MB)", label, dest.stat().st_size / 1e6)
             summary.written.append(label)
@@ -185,25 +206,126 @@ def backup_env(env_dir: Path, dest_root: Path, today: date) -> BackupSummary:
     return summary
 
 
+def backup_raw(raw_dir: Path, dest_root: Path) -> BackupSummary:
+    """Archive each raw trades CSV to <dest>/raw/<name>.tar.gz, verified like the stream
+    days. Verified files are recorded in <raw_dir>/backups.json."""
+    summary = BackupSummary()
+    manifest_path = raw_dir / "backups.json"
+    manifest = read_manifest(manifest_path)
+    for csv in sorted(raw_dir.glob("trades-*.csv")):
+        dest = raw_archive(dest_root, csv.name)
+        try:
+            if manifest.get(csv.name) == {csv.name: csv.stat().st_size} and archive_present(dest):
+                summary.present.append(csv.name)
+                continue
+            manifest[csv.name] = write_archive(raw_dir, dest, "raw", [csv.name])
+            write_manifest(manifest_path, manifest)
+            log.info(
+                "raw/%s: backed up and verified (%.1f MB)", csv.name, dest.stat().st_size / 1e6
+            )
+            summary.written.append(csv.name)
+        except (BackupError, OSError) as exc:
+            log.error("raw/%s: backup failed: %s", csv.name, exc)
+            summary.failed[csv.name] = str(exc)
+    return summary
+
+
+def raw_archive(dest_root: Path, name: str) -> Path:
+    return dest_root / "raw" / f"{name.removesuffix('.csv')}.tar.gz"
+
+
+def deletable_raw(
+    raw_dir: Path, dest_root: Path, parquet_dir: Path
+) -> tuple[list[Path], list[str]]:
+    """Raw CSVs safe to delete locally, and why each other one is not.
+
+    Safe means: recorded as verified, its archive is on disk now (not only in iCloud) and
+    verifies again against the local file (names, sizes, MD5), and its Parquet copy exists.
+    """
+    manifest = read_manifest(raw_dir / "backups.json")
+    safe: list[Path] = []
+    kept: list[str] = []
+    for csv in sorted(raw_dir.glob("trades-*.csv")):
+        dest = raw_archive(dest_root, csv.name)
+        day = csv.name.removeprefix("trades-").removesuffix(".csv")
+        if manifest.get(csv.name) != {csv.name: csv.stat().st_size}:
+            kept.append(f"{csv.name}: no verified backup")
+        elif not dest.exists():
+            kept.append(f"{csv.name}: backup is not on this Mac (iCloud only); not re-checked")
+        elif not (parquet_dir / f"trades-{day}.parquet").exists():
+            kept.append(f"{csv.name}: no Parquet copy")
+        else:
+            try:
+                verify_archive(dest, "raw", raw_dir, [csv.name])
+            except BackupError as exc:
+                kept.append(f"{csv.name}: backup did not verify: {exc}")
+                continue
+            safe.append(csv)
+    return safe, kept
+
+
 def dir_size(path: Path) -> int:
     if not path.exists():
         return 0
     return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
 
 
-def disk_usage_line(repo_data: Path, stream_root: Path, backup_root: Path) -> str:
+GIB = 1 << 30
+DiskLevel = Literal["ok", "warning", "critical"]
+
+
+@dataclass(frozen=True)
+class DiskReport:
+    line: str
+    level: DiskLevel
+    free_gib: float
+
+
+def icloud_free_bytes() -> int | None:
+    """Free iCloud storage, from `brctl quota` (no extra permissions). None if unknown."""
+    try:
+        out = subprocess.run(
+            ["/usr/bin/brctl", "quota"], capture_output=True, text=True, timeout=30, check=True
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"(\d+) bytes of quota remaining", out)
+    return int(match.group(1)) if match else None
+
+
+def disk_report(
+    repo_data: Path,
+    stream_root: Path,
+    backup_root: Path,
+    warn_gib: float,
+    critical_gib: float,
+    icloud_free: int | None = None,
+) -> DiskReport:
     usage = shutil.disk_usage(repo_data if repo_data.exists() else Path.home())
-    gib = 1 << 30
-    parts = [
-        f"disk free {usage.free / gib:.1f} GiB of {usage.total / gib:.0f} GiB"
+    free_gib = usage.free / GIB
+    level: DiskLevel = (
+        "critical" if free_gib < critical_gib else "warning" if free_gib < warn_gib else "ok"
+    )
+    parts = []
+    if level == "critical":
+        parts.append(f"CRITICAL: disk free below {critical_gib:g} GiB")
+    elif level == "warning":
+        parts.append(f"WARNING: disk free below {warn_gib:g} GiB")
+    parts += [
+        f"disk free {free_gib:.1f} GiB of {usage.total / GIB:.0f} GiB"
         f" ({100 * usage.used / usage.total:.0f}% used)",
-        f"data/ {dir_size(repo_data) / gib:.2f} GiB",
+        f"data/ {dir_size(repo_data) / GIB:.2f} GiB",
     ]
     if stream_root.exists():
         for env_dir in sorted(p for p in stream_root.iterdir() if p.is_dir()):
             parts.append(f"stream/{env_dir.name} {dir_size(env_dir) / 1e6:.0f} MB")
     parts.append(f"backups {dir_size(backup_root) / 1e6:.0f} MB")
-    return "; ".join(parts)
+    parts.append(
+        f"iCloud free {icloud_free / GIB:.1f} GiB"
+        if icloud_free is not None
+        else "iCloud free unknown"
+    )
+    return DiskReport(line="; ".join(parts), level=level, free_gib=free_gib)
 
 
 def today_utc() -> date:

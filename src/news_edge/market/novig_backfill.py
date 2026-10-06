@@ -138,6 +138,21 @@ def _backfill_day(
     verify: bool,
 ) -> None:
     raw = novig_public.raw_path(raw_dir, day)
+    parquet = parquet_path(parquet_dir, day)
+    if not raw.exists() and parquet.exists():
+        # The raw CSV was backed up and deleted locally (scripts/backup_novig_raw.py).
+        # The Parquet copy is the local source; never download the CSV again for it.
+        if conn is not None and not is_loaded(conn, day):
+            # A fresh database has no file row; size 0 marks "raw CSV only in the backup".
+            conn.execute(
+                "INSERT INTO novig_trade_files (file_date, size_bytes, downloaded_at)"
+                " VALUES (%s, 0, now()) ON CONFLICT (file_date) DO NOTHING",
+                (day,),
+            )
+            rows = load_day(conn, day, pl.read_parquet(parquet))
+            summary.loaded.append(day)
+            log.info("%s: loaded %d rows from Parquet (raw CSV is in the backup)", day, rows)
+        return
     etag = None
     if verify and raw.exists():
         expected = novig_public.md5_from_etag(novig_public.remote_etag(http, day))

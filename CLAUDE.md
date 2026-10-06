@@ -60,18 +60,23 @@ launchctl kickstart -k gui/$(id -u)/com.newsedge.novig-recorder   # restart, e.g
 tail -f logs/novig-recorder.log logs/novig-trades.log logs/novig-backup.log
 uv run python scripts/run_novig_recorder.py --gaps            # windows with no stream data
 uv run python scripts/backup_novig_stream.py --disk-only      # disk usage line now
+uv run python scripts/backup_novig_raw.py                     # back up raw trade CSVs, verified
+uv run python scripts/backup_novig_raw.py --delete-verified   # then asks before deleting any
 ```
 
 - `com.newsedge.novig-trades`: trade-file backfill at 04:30 and 16:30 local.
 - `com.newsedge.novig-recorder`: order-book recorder, kept alive and run under
   `caffeinate -i -s`. It opens several connections (`recorder.connections` in
-  `config/default.yaml`), since Novig caps each at 2048 markets.
+  `config/default.yaml`), since Novig caps each at 2048 markets. It checks free disk
+  every 2 minutes and below 5 GiB stops cleanly (logged as a gap, with a notification).
+  It then stays down until restarted with `launchctl kickstart -k`.
 - `com.newsedge.novig-backup`: 03:00 local. Archives each finished UTC day of
   `data/novig/stream/<env>/` to `backup.dest` in `config/default.yaml` (an iCloud Drive
   folder outside Desktop and Documents), verifies each archive (opens, every file reads
-  back, names and sizes match), copies the gap log, and logs a disk-usage line. Verified
-  days are listed in `data/novig/stream/<env>/backups.json`. Local files are never
-  deleted.
+  back, names, sizes, and MD5s match), copies the gap log, and logs a disk-usage line
+  with free iCloud storage (`brctl quota`). The line says WARNING below 20 GiB free and
+  CRITICAL below 10 GiB, each with a macOS notification. Verified days are listed in
+  `data/novig/stream/<env>/backups.json`. Local files are never deleted.
 
 `scripts/install_daily_jobs.sh` leaves a loaded job alone when its plist is unchanged,
 so rerunning it does not restart the recorder.
@@ -98,6 +103,10 @@ so rerunning it does not restart the recorder.
 - Never place live orders. Execution stays in shadow mode until the user says otherwise.
 - Do not build the signal engine, executor, or audit UI until Stage A results are
   reviewed and approved.
+- Never delete data without asking the user first. `backup_novig_raw.py
+  --delete-verified` asks before deleting, and keeps any CSV whose backup is not on
+  this Mac or that has no Parquet copy. The trades job never downloads a deleted raw
+  CSV again; its Parquet copy is the local source.
 - Use the locks. Never run two backfills or two recorders at once (`data/novig/.backfill.lock`,
   `data/novig/.recorder.lock`).
 

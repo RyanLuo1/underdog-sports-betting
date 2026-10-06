@@ -37,6 +37,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidStatus
 
+from news_edge.core.notify import notify
+
 log = logging.getLogger(__name__)
 
 WS_PATH = "/v3/ws"
@@ -68,6 +70,9 @@ class RecorderConfig(BaseModel):
     max_markets_per_connection: int = Field(1800, le=MAX_WATCHED_MARKETS)
     refresh_seconds: float = 300.0
     subscribe_batch: int = 16
+    # Stop cleanly, logged as a gap, before the disk fills and writes start failing.
+    min_free_gib: float = 5.0
+    disk_check_seconds: float = 120.0
 
 
 class CatalogEvent(BaseModel):
@@ -372,7 +377,9 @@ def missing_windows(log_events: Iterable[GapEvent]) -> list[Window]:
         elif e.kind == "stop":
             if outage is None:
                 starts = [w.start for w in slot_outage.values()]
-                outage = Window(start=min([*starts, e.ts]), end=None, scope="all", cause="stop")
+                outage = Window(
+                    start=min([*starts, e.ts]), end=None, scope="all", cause=e.detail or "stop"
+                )
             covered = dict.fromkeys(covered, False)
             slot_outage = {}
             drop_market_gaps()
@@ -477,6 +484,7 @@ class Recorder:
         self.gaps = GapLog(root / "connections.jsonl")
         self.max_backoff_s = max_backoff_s
         self.stopping = asyncio.Event()
+        self.stop_reason: str | None = None
         # Novig throttles per key, so every connection draws from one bucket.
         self.bucket = TokenBucket(STREAM_CAPACITY, STREAM_REFILL_PER_S)
         self.assignment: Assignment = {s: set() for s in range(cfg.connections)}
@@ -489,6 +497,7 @@ class Recorder:
         background = [
             asyncio.create_task(self._heartbeat()),
             asyncio.create_task(self._plan_loop()),
+            asyncio.create_task(self._disk_guard()),
         ]
         try:
             await asyncio.gather(*(self._run_slot(s) for s in range(self.cfg.connections)))
@@ -497,10 +506,29 @@ class Recorder:
                 task.cancel()
             await asyncio.gather(*background, return_exceptions=True)
             self.writer.close()
-            self.gaps.record("stop")
+            self.gaps.record("stop", detail=self.stop_reason)
 
-    def stop(self) -> None:
+    def stop(self, reason: str | None = None) -> None:
+        if reason and not self.stopping.is_set():
+            self.stop_reason = reason
         self.stopping.set()
+
+    def free_gib(self) -> float:
+        return shutil.disk_usage(self.writer.root).free / (1 << 30)
+
+    async def _disk_guard(self) -> None:
+        while True:
+            free = self.free_gib()
+            if free < self.cfg.min_free_gib:
+                reason = (
+                    f"low disk: {free:.1f} GiB free, below {self.cfg.min_free_gib:g} GiB;"
+                    " recorder stopped. Free space, then restart it."
+                )
+                log.error("%s", reason)
+                notify("Novig recorder stopped", reason)
+                self.stop(reason)
+                return
+            await asyncio.sleep(self.cfg.disk_check_seconds)
 
     async def _run_slot(self, slot: int) -> None:
         """Connect, record, and reconnect this slot with backoff until stopped."""

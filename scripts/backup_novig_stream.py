@@ -4,6 +4,10 @@ launchd runs this at 03:00 local. Each day becomes a verified .tar.gz under the 
 folder in config/default.yaml (backup.dest); days already backed up are re-checked, so a
 missed night is caught up. Local files are never deleted. Exits 1 if any day failed.
 
+The disk line includes free iCloud storage (from `brctl quota`) and says WARNING or
+CRITICAL, with a macOS notification, when free disk drops below backup.warn_free_gib or
+backup.critical_free_gib.
+
     uv run python scripts/backup_novig_stream.py
     uv run python scripts/backup_novig_stream.py --disk-only    # just the usage line
 """
@@ -16,9 +20,11 @@ from pathlib import Path
 
 import yaml
 
+from news_edge.core.notify import notify
 from news_edge.market.novig_stream_backup import (
     backup_env,
-    disk_usage_line,
+    disk_report,
+    icloud_free_bytes,
     today_utc,
 )
 
@@ -58,7 +64,25 @@ def main(argv: list[str] | None = None) -> int:
                     len(summary.failed),
                     dest_root / env_dir.name,
                 )
-    log.info("%s", disk_usage_line(args.data_dir, stream_root, dest_root))
+    backup_cfg = config["backup"]
+    report = disk_report(
+        args.data_dir,
+        stream_root,
+        dest_root,
+        warn_gib=float(backup_cfg.get("warn_free_gib", 20)),
+        critical_gib=float(backup_cfg.get("critical_free_gib", 10)),
+        icloud_free=icloud_free_bytes(),
+    )
+    if report.level == "ok":
+        log.info("%s", report.line)
+    else:
+        log.log(
+            logging.CRITICAL if report.level == "critical" else logging.WARNING, "%s", report.line
+        )
+        notify(
+            f"Mac disk {report.level}: {report.free_gib:.1f} GiB free",
+            "Free space soon; the Novig recorder stops below 5 GiB. See logs/novig-backup.log.",
+        )
     return 1 if failed else 0
 
 

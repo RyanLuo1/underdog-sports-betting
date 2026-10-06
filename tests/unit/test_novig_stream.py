@@ -436,3 +436,45 @@ async def test_recorder_splits_events_across_connections(tmp_path: Path) -> None
     assert sorted(e for evs in covered.values() for e in evs or []) == [EV_A, EV_B, EV_C]
     windows = ns.missing_windows(events)
     assert [(w.scope, w.cause) for w in windows] == [("all", "not running"), ("all", "stop")]
+
+
+async def test_recorder_stops_cleanly_on_low_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def handler(ws: ServerConnection) -> None:
+        async for raw in ws:
+            msg = json.loads(raw)
+            await ws.send(json.dumps({"nonce": msg["nonce"], "snapshot": {}}))
+
+    async def fetch() -> ns.Catalog:
+        return ns.Catalog(events=[_event(EV_A, ns.now_ms() + HOUR_MS)], market_counts={EV_A: 1})
+
+    sent: list[str] = []
+
+    def fake_notify(title: str, message: str) -> bool:
+        sent.append(message)
+        return True
+
+    monkeypatch.setattr(ns, "notify", fake_notify)
+    async with serve(handler, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        recorder = ns.Recorder(
+            ws_url=f"ws://127.0.0.1:{port}/v3/ws",
+            headers=dict,
+            catalog=fetch,
+            root=tmp_path,
+            cfg=_cfg(connections=1, disk_check_seconds=0.05),
+        )
+        free = iter([50.0, 50.0, 4.2])  # plenty, then below the 5 GiB floor
+        monkeypatch.setattr(recorder, "free_gib", lambda: next(free, 4.2))
+        await asyncio.wait_for(recorder.run(), 10)  # returns on its own
+
+    events = ns.read_gap_log(tmp_path / "connections.jsonl")
+    stop = events[-1]
+    assert stop.kind == "stop"
+    assert stop.detail is not None and stop.detail.startswith("low disk: 4.2 GiB free")
+    assert sent and sent[0] == stop.detail
+    windows = ns.missing_windows(events)
+    assert windows[-1].scope == "all"
+    assert windows[-1].end is None
+    assert windows[-1].cause.startswith("low disk")

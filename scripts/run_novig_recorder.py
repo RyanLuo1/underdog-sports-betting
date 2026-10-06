@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import fcntl
 import logging
+import shutil
 import signal
 import sys
 from datetime import UTC, datetime
@@ -101,6 +102,17 @@ def main(argv: list[str] | None = None) -> int:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             log.warning("another recorder is running; exiting")
+            return 0
+        root.mkdir(parents=True, exist_ok=True)
+        free = shutil.disk_usage(root).free / (1 << 30)
+        if free < cfg.min_free_gib:
+            # A clean exit, so launchd does not restart it in a loop.
+            log.error(
+                "low disk: %.1f GiB free, below %g GiB; not starting. Free space, then run "
+                "launchctl kickstart -k gui/$(id -u)/com.newsedge.novig-recorder",
+                free,
+                cfg.min_free_gib,
+            )
             return 0
         log.info("recording %s %s to %s", settings.novig_env, cfg.leagues, root)
         asyncio.run(record(root, cfg, signer, HOSTS[settings.novig_env]))
