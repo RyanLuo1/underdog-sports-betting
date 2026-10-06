@@ -19,3 +19,13 @@ min_edge:
   news_speed: null
   stale_after_sharp_move: null
   second_order_prop: null
+
+# Order-book recorder (scripts/run_novig_recorder.py). Novig caps one connection at
+# 2048 watched markets, and an event counts as all of its markets.
+recorder:
+  leagues: [NFL]
+  lookback_hours: 8      # keep events that started this long ago (in play)
+  horizon_hours: 168     # pick up events starting within this window, soonest first
+  max_markets: 1800      # headroom under 2048 for markets that open after subscribe
+  refresh_seconds: 300   # re-read the catalog this often
+  subscribe_batch: 16    # events per subscribe (16 tokens each, 512 burst, 4/s refill)

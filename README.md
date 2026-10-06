@@ -27,11 +27,26 @@ uv run pytest
 ```sh
 uv run python scripts/backfill_novig_trades.py           # fill in any missing days
 uv run python scripts/backfill_novig_trades.py --verify  # also re-check files against Novig's MD5
-scripts/install_daily_jobs.sh                            # run it daily via launchd (4:30, 16:30)
+scripts/install_daily_jobs.sh                            # run it via launchd (4:30, 16:30)
 ```
 
 Raw CSVs go to `data/novig/raw/`, Parquet to `data/novig/parquet/`, rows to `novig_trades`.
 Logs are in `logs/novig-trades.log`.
+
+## Novig order-book recorder
+
+```sh
+uv run python scripts/create_read_key.py --env paper --mgmt-key-id <id> \
+    --mgmt-pem <path> --out ~/.novig/paper-recorder.pem   # once; prints the read key ID
+uv run python scripts/run_novig_recorder.py               # record until stopped
+uv run python scripts/run_novig_recorder.py --gaps        # print windows with no data
+```
+
+Set `NOVIG_ENV`, `NOVIG_TRADING_KEY_ID`, and `NOVIG_PRIVATE_KEY_PATH` in `.env` first.
+`scripts/install_daily_jobs.sh` also installs the recorder as a launchd job that restarts
+after a crash and keeps the Mac awake (`caffeinate -i -s`) while it runs. Raw messages go
+to `data/novig/stream/<env>/`, with every connect, disconnect, and seq gap in
+`connections.jsonl` there. Logs are in `logs/novig-recorder.log`.
 
 ## Layout
 

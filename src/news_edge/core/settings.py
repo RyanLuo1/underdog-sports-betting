@@ -1,6 +1,7 @@
 """Runtime settings, read from the environment or a local .env file."""
 
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -11,6 +12,9 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql+psycopg://news_edge:news_edge@localhost:5432/news_edge"
 
+    # Novig keys exist per environment; the key below must belong to novig_env.
+    # The recorder uses a trading::read key (scripts/create_read_key.py).
+    novig_env: Literal["paper", "production"] = "paper"
     novig_trading_key_id: SecretStr | None = None
     novig_private_key_path: str | None = None
     apify_token: SecretStr | None = None

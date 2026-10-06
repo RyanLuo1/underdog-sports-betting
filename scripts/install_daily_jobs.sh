@@ -1,5 +1,6 @@
 #!/bin/sh
-# Install (or reinstall) the launchd daily jobs for this checkout.
+# Install (or reinstall) every launchd job in scripts/launchd/ for this checkout:
+# the daily trades backfill and the order-book recorder.
 #   scripts/install_daily_jobs.sh             install and load
 #   scripts/install_daily_jobs.sh --uninstall unload and remove
 set -eu

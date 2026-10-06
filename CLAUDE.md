@@ -1,0 +1,102 @@
+# CLAUDE.md
+
+This repo is public. Never write strategy details, thresholds, or edge hypotheses here,
+in commits, or anywhere else that gets committed. They live only in
+`docs/private/spec.md` (gitignored), which is the source of truth for the plan.
+
+## Project
+
+`news_edge` ingests player news, records Novig market data (the public daily trade files
+and the live order-book stream), and keeps a closing-line-value (CLV) ledger of
+decisions, so it can measure how Novig prices respond to news. It runs on one Mac:
+Postgres with TimescaleDB in Docker, and Python jobs under launchd.
+
+## Location and layout
+
+The repo is at `~/code/underdog-sports-betting`. Never put it, its `.venv`, or `data/`
+under an iCloud-synced folder (`~/Desktop`, `~/Documents`). iCloud hid `.venv` files
+and broke imports. The launchd jobs hard-code this path, so rerun
+`scripts/install_daily_jobs.sh` after any move.
+
+`src/news_edge/`:
+
+- `core/`: settings (`.env`), database connections, clock (t0 from post IDs)
+- `sources/`: news ingestion
+- `classify/`: turns posts into structured news events
+- `entities/`: players, teams, and their Novig market mappings
+- `market/`: Novig data. `novig_public` and `novig_trades` (daily trade files),
+  `novig_backfill` (download, Parquet, load), `novig_auth` (NOVIG-V3 signing),
+  `novig_keys` (subaccount and read key routes), `novig_stream` (order-book recorder)
+- `pricing/`, `signal/`: fair prices and decisions
+- `execution/`: orders (shadow mode only)
+- `ledger/`: CLV ledger
+- `research/`: analysis and notebooks
+- `ui/`: dashboard
+
+Also: `alembic/` (migrations), `config/default.yaml` (limits and schedules), `scripts/`
+(backfill, recorder, key setup, launchd templates), `tests/unit`, `tests/replay`,
+`data/` and `logs/` (gitignored).
+
+## Commands
+
+```sh
+uv sync                                  # Python 3.12 and dependencies
+cp .env.example .env                     # then fill in keys; .env is gitignored
+docker compose up -d --wait db           # Postgres + TimescaleDB on localhost:5432
+uv run alembic upgrade head              # migrate; new revision: uv run alembic revision -m "..."
+uv run pytest                            # tests; DB tests skip if Postgres is down
+uv run ruff format . && uv run ruff check .
+uv run mypy                              # strict
+```
+
+launchd jobs (`scripts/install_daily_jobs.sh` installs every template in
+`scripts/launchd/`; `--uninstall` removes them):
+
+```sh
+launchctl list | grep newsedge                                # loaded jobs, PID, last exit
+launchctl print gui/$(id -u)/com.newsedge.novig-recorder      # state and run count
+launchctl kickstart -k gui/$(id -u)/com.newsedge.novig-recorder   # restart, e.g. after editing .env
+tail -f logs/novig-recorder.log logs/novig-trades.log
+uv run python scripts/run_novig_recorder.py --gaps            # windows with no stream data
+```
+
+- `com.newsedge.novig-trades`: trade-file backfill at 04:30 and 16:30 local.
+- `com.newsedge.novig-recorder`: order-book recorder, kept alive and run under
+  `caffeinate -i -s`.
+
+## Conventions
+
+- Python 3.12. Async for network services such as the recorder. One-shot scripts may
+  be synchronous.
+- pydantic for config, settings, and records. mypy strict, ruff clean.
+- Timestamps are UTC with millisecond precision: `timestamptz` in Postgres, Unix
+  milliseconds in raw data.
+- A news item's t0 is decoded from its post ID (`core/clock.py`), never from when we saw
+  it.
+- Every module has tests. Network tests use mock transports or a local fake server.
+
+## Hard rules
+
+- Never commit secrets. Keys load from `.env` through `core/settings.py`, and `.pem`
+  files live outside the repo.
+- Never read, store, or use the Novig management key. The user runs
+  `scripts/create_read_key.py` themselves, and only that script takes it, as a
+  command-line path.
+- Point-in-time only. No signal may use data stamped after its decision time.
+- Never place live orders. Execution stays in shadow mode until the user says otherwise.
+- Use the locks. Never run two backfills or two recorders at once (`data/novig/.backfill.lock`,
+  `data/novig/.recorder.lock`).
+
+## Current status
+
+Update this section at the end of each session.
+
+As of 2026-10-06:
+
+- Built: Novig trade-file backfill (17.8M rows, Aug 4 to Oct 5), NOVIG-V3 signing,
+  read key script, order-book recorder with gap log.
+- Running: `novig-trades` (twice daily). `novig-recorder` is installed but exits until
+  `.env` has a read key.
+- Next: the user creates a Paper read key and starts the recorder. Then a Production
+  read key by Sat Oct 10. Then a second connection or a smaller budget for markets past
+  the 2048-market cap, and loading recorded books into Postgres.

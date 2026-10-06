@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Novig order-book recorder. Rendered and loaded by scripts/install_daily_jobs.sh. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.newsedge.novig-recorder</string>
+    <!-- caffeinate -i -s keeps the Mac from sleeping for as long as the recorder runs
+         (-s applies on AC power). Closing a laptop lid still sleeps it. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-i</string>
+        <string>-s</string>
+        <string>__UV__</string>
+        <string>run</string>
+        <string>python</string>
+        <string>scripts/run_novig_recorder.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- Restart after a crash (non-zero exit). A clean exit, such as a missing key or
+         a recorder that already holds the lock, stays down. Disconnects reconnect
+         inside the process. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>__REPO__/logs/novig-recorder.log</string>
+    <key>StandardErrorPath</key>
+    <string>__REPO__/logs/novig-recorder.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>
