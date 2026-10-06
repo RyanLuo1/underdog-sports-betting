@@ -21,11 +21,14 @@ min_edge:
   second_order_prop: null
 
 # Order-book recorder (scripts/run_novig_recorder.py). Novig caps one connection at
-# 2048 watched markets, and an event counts as all of its markets.
+# 2048 watched markets, and an event counts as all of its markets. A full NFL week with
+# props open runs to roughly 5,000-6,000 markets, so the recorder spreads events across
+# several connections; the subscribe throttle is per key and shared by all of them.
 recorder:
   leagues: [NFL]
-  lookback_hours: 8      # keep events that started this long ago (in play)
-  horizon_hours: 168     # pick up events starting within this window, soonest first
-  max_markets: 1800      # headroom under 2048 for markets that open after subscribe
-  refresh_seconds: 300   # re-read the catalog this often
-  subscribe_batch: 16    # events per subscribe (16 tokens each, 512 burst, 4/s refill)
+  lookback_hours: 8                 # keep events that started this long ago (in play)
+  horizon_hours: 168                # pick up events starting within this window, soonest first
+  connections: 4                    # websocket connections, each with its own market budget
+  max_markets_per_connection: 1800  # headroom under 2048 for markets that open later
+  refresh_seconds: 300              # re-read the catalog and repack this often
+  subscribe_batch: 16               # events per subscribe (16 tokens each, 512 burst, 4/s)

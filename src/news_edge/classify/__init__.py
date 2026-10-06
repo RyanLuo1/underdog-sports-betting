@@ -1,1 +1,1 @@
-"""Post classification: Jev client and rules-based fallback."""
+"""Post classification: a rules-based parser for Underdog's templated posts."""

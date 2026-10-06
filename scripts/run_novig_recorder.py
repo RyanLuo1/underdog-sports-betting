@@ -47,7 +47,12 @@ def print_gaps(root: Path) -> int:
         print(f"no gap log at {path}")
         return 0
     for w in missing_windows(read_gap_log(path)):
-        where = "all markets" if w.scope == "all" else f"market {w.market}"
+        if w.scope == "all":
+            where = "all events"
+        elif w.scope == "connection":
+            where = f"connection {w.slot}: events {', '.join(w.events or []) or '(none)'}"
+        else:
+            where = f"connection {w.slot}: market {w.market}"
         print(f"{_fmt(w.start)} -> {_fmt(w.end)}  {where}  ({w.cause})")
     return 0
 

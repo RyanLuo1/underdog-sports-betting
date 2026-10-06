@@ -22,7 +22,8 @@ and broke imports. The launchd jobs hard-code this path, so rerun
 
 - `core/`: settings (`.env`), database connections, clock (t0 from post IDs)
 - `sources/`: news ingestion
-- `classify/`: turns posts into structured news events
+- `classify/`: turns posts into structured news events with a rules-based parser (the
+  only classifier)
 - `entities/`: players, teams, and their Novig market mappings
 - `market/`: Novig data. `novig_public` and `novig_trades` (daily trade files),
   `novig_backfill` (download, Parquet, load), `novig_auth` (NOVIG-V3 signing),
@@ -62,7 +63,8 @@ uv run python scripts/run_novig_recorder.py --gaps            # windows with no 
 
 - `com.newsedge.novig-trades`: trade-file backfill at 04:30 and 16:30 local.
 - `com.newsedge.novig-recorder`: order-book recorder, kept alive and run under
-  `caffeinate -i -s`.
+  `caffeinate -i -s`. It opens several connections (`recorder.connections` in
+  `config/default.yaml`), since Novig caps each at 2048 markets.
 
 ## Conventions
 
@@ -84,6 +86,8 @@ uv run python scripts/run_novig_recorder.py --gaps            # windows with no 
   command-line path.
 - Point-in-time only. No signal may use data stamped after its decision time.
 - Never place live orders. Execution stays in shadow mode until the user says otherwise.
+- Do not build the signal engine, executor, or audit UI until Stage A results are
+  reviewed and approved.
 - Use the locks. Never run two backfills or two recorders at once (`data/novig/.backfill.lock`,
   `data/novig/.recorder.lock`).
 
@@ -94,9 +98,14 @@ Update this section at the end of each session.
 As of 2026-10-06:
 
 - Built: Novig trade-file backfill (17.8M rows, Aug 4 to Oct 5), NOVIG-V3 signing,
-  read key script, order-book recorder with gap log.
+  read key script, and the order-book recorder (4 connections, gap log).
 - Running: `novig-trades` (twice daily). `novig-recorder` is installed but exits until
   `.env` has a read key.
-- Next: the user creates a Paper read key and starts the recorder. Then a Production
-  read key by Sat Oct 10. Then a second connection or a smaller budget for markets past
-  the 2048-market cap, and loading recorded books into Postgres.
+- Next, in order (see the Plan section of `docs/private/spec.md`):
+  1. Recorder on Production by Sat Oct 10. The user creates the read key with
+     `scripts/create_read_key.py` and fills in `.env`.
+  2. Stage A as a research notebook in `src/news_edge/research/notebooks/`, not a
+     service: @UnderdogNFL posts since Aug 4 (Apify backfill) joined to `novig_trades`.
+     The method is in the spec, not here.
+  3. Go/no-go from Stage A results, decided by the user.
+  4. Only on a go: the signal engine, executor (shadow mode), and audit UI.

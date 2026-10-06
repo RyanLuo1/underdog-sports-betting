@@ -1,16 +1,18 @@
 """Record Novig's order-book stream to disk, and log every gap in coverage.
 
-One websocket, subscribed per event on the `book` channel, which reports each resting
-order as it is added and each removal as a fill or a cancel. Every message received is
-written verbatim, with its receive time, to hourly JSONL files:
+Subscribes per event on the `book` channel, which reports each resting order as it is
+added and each removal as a fill or a cancel. Novig caps one connection at 2048 watched
+markets, so the recorder runs several connections ("slots") and a planner packs events
+into them, soonest first. Every message received is written verbatim, with its receive
+time, to hourly JSONL files:
 
     data/novig/stream/<env>/<YYYY-MM-DD>/<HH>.jsonl[.gz]     (UTC)
 
 Coverage gaps go to data/novig/stream/<env>/connections.jsonl, one event per line:
-process start and stop, connect, subscribe, disconnect, per-market seq gaps and their
-resyncs, and a heartbeat every minute so a crash is bounded too. `covered` marks the
-moment a connection has subscribed to the whole selection. `missing_windows`
-turns that log into the exact windows with no data.
+process start and stop, and per slot: connect, subscribe, disconnect, per-market seq gaps
+and their resyncs. A heartbeat every minute bounds a crash too. `covered` marks the
+moment a slot's connection has subscribed to everything planned for it.
+`missing_windows` turns that log into the exact windows with no data.
 
 Protocol: https://docs.novig.com/api/streaming/connection.md
 """
@@ -38,10 +40,12 @@ from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidSta
 log = logging.getLogger(__name__)
 
 WS_PATH = "/v3/ws"
-# Novig's `stream` throttle, and the cost of one subject on `book`.
+# Novig's `stream` throttle (per key, shared by every connection), the cost of one
+# subject on `book`, and the cost of opening a connection.
 STREAM_CAPACITY = 512
 STREAM_REFILL_PER_S = 4.0
 BOOK_WEIGHT = 16
+WS_UPGRADE_COST = 32
 # Novig caps one connection at 2048 watched markets; an event counts as its markets.
 MAX_WATCHED_MARKETS = 2048
 DONE_STATUSES = frozenset({"SETTLED", "FINAL", "CANCELED"})
@@ -57,10 +61,11 @@ class RecorderConfig(BaseModel):
 
     leagues: list[str] = ["NFL"]
     # Keep events that started up to this long ago (in play), and pick up events this
-    # far ahead, soonest first, until the market budget is spent.
+    # far ahead, soonest first, until every connection's market budget is spent.
     lookback_hours: float = 8.0
     horizon_hours: float = 168.0
-    max_markets: int = Field(1800, le=MAX_WATCHED_MARKETS)
+    connections: int = Field(4, ge=1, le=8)
+    max_markets_per_connection: int = Field(1800, le=MAX_WATCHED_MARKETS)
     refresh_seconds: float = 300.0
     subscribe_batch: int = 16
 
@@ -81,36 +86,60 @@ class Catalog:
     market_counts: dict[str, int]
 
 
+Assignment = dict[int, set[str]]
+
+
 @dataclass
-class Selection:
-    event_ids: list[str]
-    markets: int
+class Plan:
+    """Which events each connection slot records, and what fit nowhere."""
+
+    slots: Assignment
+    markets: dict[int, int]
     skipped: list[str] = field(default_factory=list)
 
 
-def select_events(catalog: Catalog, now: int, cfg: RecorderConfig) -> Selection:
-    """Live and upcoming events, soonest first, while their markets fit the budget."""
+def plan_slots(
+    catalog: Catalog, now: int, cfg: RecorderConfig, current: Assignment | None = None
+) -> Plan:
+    """Pack live and upcoming events into the connection slots, soonest first.
+
+    An event stays in its current slot while it still fits, so a refresh does not move
+    it (a move unsubscribes on one connection and resubscribes on another). New events go
+    to the slot with the most room. Events that fit nowhere are skipped."""
     earliest = now - int(cfg.lookback_hours * 3_600_000)
     latest = now + int(cfg.horizon_hours * 3_600_000)
-    candidates = sorted(
-        (
-            e
-            for e in catalog.events
-            if e.league in cfg.leagues
-            and e.status not in DONE_STATUSES
-            and earliest <= e.starts_ts <= latest
-        ),
-        key=lambda e: (e.starts_ts, e.event_id),
+    wanted = [
+        e.event_id
+        for e in sorted(catalog.events, key=lambda e: (e.starts_ts, e.event_id))
+        if e.league in cfg.leagues
+        and e.status not in DONE_STATUSES
+        and earliest <= e.starts_ts <= latest
+    ]
+    budget = cfg.max_markets_per_connection
+    slot_of = {e: s for s, events in (current or {}).items() for e in events}
+    plan = Plan(
+        slots={s: set() for s in range(cfg.connections)},
+        markets=dict.fromkeys(range(cfg.connections), 0),
     )
-    chosen = Selection(event_ids=[], markets=0)
-    for event in candidates:
-        n = catalog.market_counts.get(event.event_id, 0)
-        if chosen.markets + n > cfg.max_markets:
-            chosen.skipped.append(event.event_id)
+    placed: set[str] = set()
+    for event in wanted:
+        s = slot_of.get(event)
+        n = catalog.market_counts.get(event, 0)
+        if s is not None and s in plan.slots and plan.markets[s] + n <= budget:
+            plan.slots[s].add(event)
+            plan.markets[s] += n
+            placed.add(event)
+    for event in wanted:
+        if event in placed:
             continue
-        chosen.event_ids.append(event.event_id)
-        chosen.markets += n
-    return chosen
+        n = catalog.market_counts.get(event, 0)
+        s = min(plan.slots, key=lambda k: (plan.markets[k], k))
+        if plan.markets[s] + n > budget:
+            plan.skipped.append(event)
+            continue
+        plan.slots[s].add(event)
+        plan.markets[s] += n
+    return plan
 
 
 async def fetch_catalog(client: httpx.AsyncClient, leagues: list[str]) -> Catalog:
@@ -251,6 +280,7 @@ GapKind = Literal[
     "start",
     "stop",
     "heartbeat",
+    "planned",
     "connecting",
     "connected",
     "subscribed",
@@ -266,6 +296,8 @@ GapKind = Literal[
 class GapEvent(BaseModel):
     ts: int
     kind: GapKind
+    slot: int | None = None
+    slots: int | None = None
     conn: str | None = None
     market: str | None = None
     channel: str | None = None
@@ -282,10 +314,11 @@ class GapLog:
 
     def record(self, kind: GapKind, **fields: Any) -> GapEvent:
         event = GapEvent(ts=now_ms(), kind=kind, **fields)
+        line = event.model_dump_json(exclude_none=True)
         with self.path.open("a") as f:
-            f.write(event.model_dump_json(exclude_none=True) + "\n")
+            f.write(line + "\n")
         level = logging.WARNING if kind in ("disconnected", "seq_gap", "error") else logging.INFO
-        log.log(level, "%s", event.model_dump_json(exclude_none=True))
+        log.log(level, "%s", line)
         return event
 
 
@@ -297,52 +330,104 @@ def read_gap_log(path: Path) -> list[GapEvent]:
 class Window(BaseModel):
     start: int
     end: int | None
-    scope: Literal["all", "market"]
+    scope: Literal["all", "connection", "market"]
+    slot: int | None = None
+    events: list[str] | None = None
     market: str | None = None
     cause: str
 
 
-def missing_windows(events: Iterable[GapEvent]) -> list[Window]:
-    """Windows with no data. A whole-stream window runs from the disconnect (or, after a
-    crash, the last log line) until the next connection is `covered`. A market window runs from
-    its seq gap to its resync. An open window has end=None."""
+def missing_windows(log_events: Iterable[GapEvent]) -> list[Window]:
+    """Windows with no data. An open window has end=None.
+
+    - all: the process was not recording, from start (or, after a crash, the last log
+      line) until every slot is covered, and from a stop.
+    - connection: one slot's connection was down, from its disconnect until that slot is
+      covered again. `events` lists the events it was recording.
+    - market: one market's seq gap, until its resync.
+    """
     windows: list[Window] = []
-    covered = False
+    covered: dict[int, bool] = {}
+    slot_events: dict[int, set[str]] = {}
     outage: Window | None = None
+    slot_outage: dict[int, Window] = {}
+    market_gaps: dict[str, tuple[int | None, Window]] = {}
     last_ts: int | None = None
-    market_gaps: dict[str, Window] = {}
-    for e in events:
+
+    def drop_market_gaps(slot: int | None = None) -> None:
+        for market in [m for m, (s, _) in market_gaps.items() if slot is None or s == slot]:
+            del market_gaps[market]
+
+    for e in log_events:
+        slot = e.slot
         if e.kind == "start":
-            if covered:  # the previous process died without logging a stop
+            if any(covered.values()):  # the previous process died without logging a stop
                 outage = Window(start=last_ts or e.ts, end=None, scope="all", cause="crash")
             elif outage is None:
                 outage = Window(start=e.ts, end=None, scope="all", cause="not running")
-            covered = False
-            market_gaps.clear()
-        elif e.kind in ("disconnected", "stop") and covered:
-            cause = e.detail or e.kind
-            outage = Window(start=e.ts, end=None, scope="all", cause=cause)
-            covered = False
-            market_gaps.clear()
-        elif e.kind == "covered" and not covered:
-            if outage is not None:
+            covered = dict.fromkeys(range(e.slots or 1), False)
+            slot_events = {}
+            slot_outage = {}
+            drop_market_gaps()
+        elif e.kind == "stop":
+            if outage is None:
+                starts = [w.start for w in slot_outage.values()]
+                outage = Window(start=min([*starts, e.ts]), end=None, scope="all", cause="stop")
+            covered = dict.fromkeys(covered, False)
+            slot_outage = {}
+            drop_market_gaps()
+        elif slot is None:
+            pass
+        elif e.kind == "subscribed":
+            slot_events.setdefault(slot, set()).update(e.events or [])
+        elif e.kind == "unsubscribed":
+            slot_events.setdefault(slot, set()).difference_update(e.events or [])
+        elif e.kind == "disconnected" and covered.get(slot):
+            covered[slot] = False
+            slot_outage[slot] = Window(
+                start=e.ts,
+                end=None,
+                scope="connection",
+                slot=slot,
+                events=sorted(slot_events.get(slot, set())),
+                cause=e.detail or "disconnected",
+            )
+            slot_events[slot] = set()
+            drop_market_gaps(slot)
+        elif e.kind == "covered" and not covered.get(slot, False):
+            covered[slot] = True
+            slot_events[slot] = set(e.events or [])
+            if slot in slot_outage:
+                gap = slot_outage.pop(slot)
+                gap.end = e.ts
+                windows.append(gap)
+            if outage is not None and covered and all(covered.values()):
                 outage.end = e.ts
                 windows.append(outage)
                 outage = None
-            covered = True
-        elif e.kind == "seq_gap" and covered and e.market and e.market not in market_gaps:
-            market_gaps[e.market] = Window(
-                start=e.ts, end=None, scope="market", market=e.market, cause="seq gap"
-            )
+        elif e.kind == "seq_gap" and covered.get(slot) and e.market:
+            if e.market not in market_gaps:
+                market_gaps[e.market] = (
+                    slot,
+                    Window(
+                        start=e.ts,
+                        end=None,
+                        scope="market",
+                        slot=slot,
+                        market=e.market,
+                        cause="seq gap",
+                    ),
+                )
         elif e.kind == "resynced" and e.market in market_gaps:
-            gap = market_gaps.pop(e.market)
+            _, gap = market_gaps.pop(e.market)
             gap.end = e.ts
             windows.append(gap)
         last_ts = e.ts
     if outage is not None:
         windows.append(outage)
-    windows.extend(market_gaps.values())
-    return sorted(windows, key=lambda w: w.start)
+    windows.extend(slot_outage.values())
+    windows.extend(w for _, w in market_gaps.values())
+    return sorted(windows, key=lambda w: (w.start, w.slot or 0))
 
 
 class TokenBucket:
@@ -353,17 +438,19 @@ class TokenBucket:
         self.refill = refill_per_s
         self._tokens = capacity
         self._at = time.monotonic()
+        self._lock = asyncio.Lock()
 
     async def take(self, n: float) -> None:
         n = min(n, self.capacity)
-        while True:
-            now = time.monotonic()
-            self._tokens = min(self.capacity, self._tokens + (now - self._at) * self.refill)
-            self._at = now
-            if self._tokens >= n:
-                self._tokens -= n
-                return
-            await asyncio.sleep((n - self._tokens) / self.refill)
+        async with self._lock:  # first come, first served across connections
+            while True:
+                now = time.monotonic()
+                self._tokens = min(self.capacity, self._tokens + (now - self._at) * self.refill)
+                self._at = now
+                if self._tokens >= n:
+                    self._tokens -= n
+                    return
+                await asyncio.sleep((n - self._tokens) / self.refill)
 
 
 CatalogFetcher = Callable[[], Awaitable[Catalog]]
@@ -371,6 +458,8 @@ HeaderFactory = Callable[[], dict[str, str]]
 
 
 class Recorder:
+    """Runs one planner and one connection per slot until stop() is called."""
+
     def __init__(
         self,
         ws_url: str,
@@ -388,59 +477,111 @@ class Recorder:
         self.gaps = GapLog(root / "connections.jsonl")
         self.max_backoff_s = max_backoff_s
         self.stopping = asyncio.Event()
+        # Novig throttles per key, so every connection draws from one bucket.
+        self.bucket = TokenBucket(STREAM_CAPACITY, STREAM_REFILL_PER_S)
+        self.assignment: Assignment = {s: set() for s in range(cfg.connections)}
+        self.planned = asyncio.Event()
+        self.plan_changed = {s: asyncio.Event() for s in range(cfg.connections)}
 
     async def run(self) -> None:
-        """Connect, record, and reconnect with backoff until stop() is called."""
-        self.gaps.record("start")
+        self.gaps.record("start", slots=self.cfg.connections)
         self.writer.compress_closed()
-        heartbeat = asyncio.create_task(self._heartbeat())
-        backoff = 1.0
+        background = [
+            asyncio.create_task(self._heartbeat()),
+            asyncio.create_task(self._plan_loop()),
+        ]
         try:
-            while not self.stopping.is_set():
-                session = _Session(self)
-                retry_after = await session.run()
-                if session.covered:
-                    backoff = 1.0
-                if self.stopping.is_set():
-                    break
-                delay = retry_after or backoff * random.uniform(0.5, 1.0)  # noqa: S311
-                backoff = min(self.max_backoff_s, backoff * 2)
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(self.stopping.wait(), delay)
+            await asyncio.gather(*(self._run_slot(s) for s in range(self.cfg.connections)))
         finally:
-            heartbeat.cancel()
+            for task in background:
+                task.cancel()
+            await asyncio.gather(*background, return_exceptions=True)
             self.writer.close()
             self.gaps.record("stop")
 
     def stop(self) -> None:
         self.stopping.set()
 
+    async def _run_slot(self, slot: int) -> None:
+        """Connect, record, and reconnect this slot with backoff until stopped."""
+        backoff = 1.0
+        while not self.stopping.is_set():
+            session = _Session(self, slot)
+            retry_after = await session.run()
+            if session.covered:
+                backoff = 1.0
+            if self.stopping.is_set():
+                return
+            delay = retry_after or backoff * random.uniform(0.5, 1.0)  # noqa: S311
+            backoff = min(self.max_backoff_s, backoff * 2)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self.stopping.wait(), delay)
+
     async def _heartbeat(self) -> None:
         while True:
             await asyncio.sleep(HEARTBEAT_S)
             self.gaps.record("heartbeat")
 
+    async def _plan_loop(self) -> None:
+        while True:
+            try:
+                await self.replan()
+            except (httpx.HTTPError, ValueError, KeyError) as exc:
+                # Keep recording what we have; try the catalog again next round.
+                self.gaps.record("error", detail=f"catalog: {exc!r}")
+            await asyncio.sleep(self.cfg.refresh_seconds)
+
+    async def replan(self) -> None:
+        plan = plan_slots(await self.catalog(), now_ms(), self.cfg, self.assignment)
+        if plan.skipped:
+            log.warning(
+                "%d connections of %d markets are full; not recording %d events: %s",
+                self.cfg.connections,
+                self.cfg.max_markets_per_connection,
+                len(plan.skipped),
+                plan.skipped,
+            )
+        changed = [s for s in plan.slots if plan.slots[s] != self.assignment[s]]
+        self.assignment = plan.slots
+        if changed or not self.planned.is_set():
+            self.gaps.record(
+                "planned",
+                detail=json.dumps(
+                    {
+                        "markets": plan.markets,
+                        "events": {s: len(e) for s, e in plan.slots.items()},
+                        "skipped": plan.skipped,
+                    }
+                ),
+            )
+        for s in changed:
+            self.plan_changed[s].set()
+        self.planned.set()
+
 
 class _Session:
-    """One websocket connection: subscribe, keep the selection fresh, record, check seq."""
+    """One slot's websocket connection: follow the plan, record, check seq."""
 
-    def __init__(self, recorder: Recorder) -> None:
+    def __init__(self, recorder: Recorder, slot: int) -> None:
         self.r = recorder
+        self.slot = slot
         self.conn = uuid.uuid4().hex[:12]
         self.seq = SeqTracker()
-        self.bucket = TokenBucket(STREAM_CAPACITY, STREAM_REFILL_PER_S)
         self.nonce = 0
         self.subscribed: set[str] = set()
         self.pending: dict[int, list[str]] = {}
         self.covered = False
-        self.refreshing = False
+        self.syncing = False
         self.ws: ClientConnection | None = None
+
+    def _record(self, kind: GapKind, **fields: Any) -> None:
+        self.r.gaps.record(kind, slot=self.slot, conn=self.conn, **fields)
 
     async def run(self) -> float | None:
         """Returns a server-requested retry delay, if any."""
-        gaps = self.r.gaps
-        gaps.record("connecting", conn=self.conn)
+        self._record("connecting")
         try:
+            await self.r.bucket.take(WS_UPGRADE_COST)
             async with connect(
                 self.r.ws_url,
                 additional_headers=self.r.headers(),
@@ -451,32 +592,32 @@ class _Session:
                 compression=None,
             ) as ws:
                 self.ws = ws
-                gaps.record("connected", conn=self.conn)
+                self._record("connected")
                 await self._serve(ws)
         except InvalidStatus as exc:
             status = exc.response.status_code
             body = exc.response.body.decode(errors="replace")[:200] if exc.response.body else ""
-            gaps.record("disconnected", conn=self.conn, detail=f"handshake {status} {body}")
+            self._record("disconnected", detail=f"handshake {status} {body}")
             retry = exc.response.headers.get("Retry-After")
             return float(retry) if retry and retry.isdigit() else None
         except ConnectionClosed as exc:
             detail = f"closed {exc.rcvd.code} {exc.rcvd.reason}" if exc.rcvd else "closed 1006"
-            gaps.record("disconnected", conn=self.conn, detail=detail)
+            self._record("disconnected", detail=detail)
         except (OSError, TimeoutError, InvalidHandshake) as exc:
-            gaps.record("disconnected", conn=self.conn, detail=f"{type(exc).__name__}: {exc}")
+            self._record("disconnected", detail=f"{type(exc).__name__}: {exc}")
         except asyncio.CancelledError:
-            gaps.record("disconnected", conn=self.conn, detail="stopped")
+            self._record("disconnected", detail="stopped")
             raise
         else:
-            gaps.record("disconnected", conn=self.conn, detail="stopped")
+            self._record("disconnected", detail="stopped")
         return None
 
     async def _serve(self, ws: ClientConnection) -> None:
         reader = asyncio.create_task(self._read(ws))
-        refresher = asyncio.create_task(self._refresh_loop())
+        follower = asyncio.create_task(self._follow_plan())
         stopper = asyncio.create_task(self.r.stopping.wait())
         done, pending = await asyncio.wait(
-            {reader, refresher, stopper}, return_when=asyncio.FIRST_COMPLETED
+            {reader, follower, stopper}, return_when=asyncio.FIRST_COMPLETED
         )
         for task in pending:
             task.cancel()
@@ -494,7 +635,7 @@ class _Session:
             try:
                 msg = json.loads(text)
             except ValueError:
-                self.r.gaps.record("error", conn=self.conn, detail="unparseable message")
+                self._record("error", detail="unparseable message")
                 continue
             await self._handle(msg)
 
@@ -502,12 +643,7 @@ class _Session:
         nonce = msg.get("nonce")
         if "code" in msg and "message" in msg:
             batch = self.pending.pop(nonce, None) if isinstance(nonce, int) else None
-            self.r.gaps.record(
-                "error",
-                conn=self.conn,
-                events=batch,
-                detail=f"{msg['code']}: {msg['message']}",
-            )
+            self._record("error", events=batch, detail=f"{msg['code']}: {msg['message']}")
             self._check_covered()
             return
         if "snapshot" in msg:
@@ -515,17 +651,11 @@ class _Session:
                 self._note_event(market, body)
                 for channel, state in _channels(body):
                     if self.seq.on_snapshot(market, channel, state["seq"]):
-                        self.r.gaps.record(
-                            "resynced",
-                            conn=self.conn,
-                            market=market,
-                            channel=channel,
-                            got=state["seq"],
-                        )
+                        self._record("resynced", market=market, channel=channel, got=state["seq"])
         if isinstance(nonce, int) and nonce in self.pending:
             events = self.pending.pop(nonce)
             self.subscribed.update(events)
-            self.r.gaps.record("subscribed", conn=self.conn, events=events)
+            self._record("subscribed", events=events)
             self._check_covered()
         if "delta" in msg:
             for market, body in msg["delta"].items():
@@ -533,9 +663,8 @@ class _Session:
                 for channel, state in _channels(body):
                     expected = self.seq.expected(market, channel)
                     if self.seq.on_delta(market, channel, state["seq"]) == "gap":
-                        self.r.gaps.record(
+                        self._record(
                             "seq_gap",
-                            conn=self.conn,
                             market=market,
                             channel=channel,
                             expected=expected,
@@ -547,33 +676,20 @@ class _Session:
         if isinstance(body.get("eventId"), str):
             self.seq.event_of[market] = body["eventId"]
 
-    async def _refresh_loop(self) -> None:
+    async def _follow_plan(self) -> None:
+        await self.r.planned.wait()
+        changed = self.r.plan_changed[self.slot]
         while True:
+            changed.clear()
+            self.syncing = True
             try:
-                await self._refresh()
-            except (httpx.HTTPError, ValueError, KeyError) as exc:
-                # Keep recording what we have; try the catalog again next round.
-                self.r.gaps.record("error", conn=self.conn, detail=f"catalog: {exc!r}")
-            await asyncio.sleep(self.r.cfg.refresh_seconds)
+                await self._sync(self.r.assignment[self.slot])
+            finally:
+                self.syncing = False
+            self._check_covered()
+            await changed.wait()
 
-    async def _refresh(self) -> None:
-        self.refreshing = True
-        try:
-            await self._update_subscriptions()
-        finally:
-            self.refreshing = False
-        self._check_covered()
-
-    async def _update_subscriptions(self) -> None:
-        selection = select_events(await self.r.catalog(), now_ms(), self.r.cfg)
-        if selection.skipped:
-            log.warning(
-                "market budget %d full; not recording %d events: %s",
-                self.r.cfg.max_markets,
-                len(selection.skipped),
-                selection.skipped,
-            )
-        want = set(selection.event_ids)
+    async def _sync(self, want: set[str]) -> None:
         in_flight = {e for batch in self.pending.values() for e in batch}
         drop = sorted(self.subscribed - want)
         if drop:
@@ -581,8 +697,8 @@ class _Session:
             for e in drop:
                 self.subscribed.discard(e)
                 self.seq.drop_event(e)
-            self.r.gaps.record("unsubscribed", conn=self.conn, events=drop)
-        add = [e for e in selection.event_ids if e not in self.subscribed | in_flight]
+            self._record("unsubscribed", events=drop)
+        add = sorted(want - self.subscribed - in_flight)
         size = self.r.cfg.subscribe_batch
         for i in range(0, len(add), size):
             batch = add[i : i + size]
@@ -592,15 +708,15 @@ class _Session:
             self.pending[nonce] = batch
 
     def _check_covered(self) -> None:
-        """Once the first selection is fully acked, this connection is recording."""
-        if not self.covered and not self.pending and not self.refreshing:
+        """Once this slot's first plan is fully acked, the connection is recording."""
+        if not self.covered and not self.pending and not self.syncing and self.r.planned.is_set():
             self.covered = True
-            self.r.gaps.record("covered", conn=self.conn, events=sorted(self.subscribed))
+            self._record("covered", events=sorted(self.subscribed))
 
     async def _send(self, body: dict[str, Any], cost: float) -> int:
         if self.ws is None:
             raise RuntimeError("not connected")
-        await self.bucket.take(cost)
+        await self.r.bucket.take(cost)
         self.nonce += 1
         await self.ws.send(json.dumps({"nonce": self.nonce, **body}))
         return self.nonce

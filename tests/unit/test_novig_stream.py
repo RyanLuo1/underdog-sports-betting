@@ -30,10 +30,14 @@ def _event(
     )
 
 
-# select_events
+# plan_slots
 
 
-def test_select_events_window_status_league_and_order() -> None:
+def _cfg(**kw: Any) -> ns.RecorderConfig:
+    return ns.RecorderConfig.model_validate(kw)
+
+
+def test_plan_filters_window_status_league() -> None:
     catalog = ns.Catalog(
         events=[
             _event("later", NOW + 10 * HOUR_MS),
@@ -45,26 +49,50 @@ def test_select_events_window_status_league_and_order() -> None:
         ],
         market_counts={"later": 10, "live": 5},
     )
-    chosen = ns.select_events(catalog, NOW, ns.RecorderConfig())
-    assert chosen.event_ids == ["live", "later"]
-    assert chosen.markets == 15
-    assert chosen.skipped == []
+    plan = ns.plan_slots(catalog, NOW, _cfg(connections=1))
+    assert plan.slots == {0: {"live", "later"}}
+    assert plan.markets == {0: 15}
+    assert plan.skipped == []
 
 
-def test_select_events_respects_market_budget() -> None:
+def test_plan_spreads_across_connections_soonest_first() -> None:
+    names = ["e1", "e2", "e3", "e4", "e5"]
+    catalog = ns.Catalog(
+        events=[_event(e, NOW + i * HOUR_MS) for i, e in enumerate(names, 1)],
+        market_counts={"e1": 1500, "e2": 1000, "e3": 700, "e4": 600, "e5": 1700},
+    )
+    plan = ns.plan_slots(catalog, NOW, _cfg(connections=2, max_markets_per_connection=1800))
+    # e1 -> slot 0, e2 -> slot 1 (more room), e3 fits only beside e2, e4 fits nowhere
+    # after that, and the latest, biggest event is skipped too.
+    assert plan.slots == {0: {"e1"}, 1: {"e2", "e3"}}
+    assert plan.markets == {0: 1500, 1: 1700}
+    assert plan.skipped == ["e4", "e5"]
+
+
+def test_plan_keeps_events_in_their_slot() -> None:
     catalog = ns.Catalog(
         events=[_event(e, NOW + i * HOUR_MS) for i, e in enumerate([EV_A, EV_B, EV_C], 1)],
-        market_counts={EV_A: 600, EV_B: 1500, EV_C: 100},
+        market_counts={EV_A: 10, EV_B: 10, EV_C: 10},
     )
-    chosen = ns.select_events(catalog, NOW, ns.RecorderConfig(max_markets=1800))
-    # B does not fit after A, but the smaller C still does.
-    assert chosen.event_ids == [EV_A, EV_C]
-    assert chosen.skipped == [EV_B]
+    current = {0: set(), 1: {EV_A, EV_B}}
+    plan = ns.plan_slots(catalog, NOW, _cfg(connections=2), current)
+    assert plan.slots == {0: {EV_C}, 1: {EV_A, EV_B}}
+
+
+def test_plan_moves_event_when_its_slot_overflows() -> None:
+    catalog = ns.Catalog(
+        events=[_event(e, NOW + i * HOUR_MS) for i, e in enumerate([EV_A, EV_B], 1)],
+        market_counts={EV_A: 1000, EV_B: 900},  # B grew; both no longer fit in slot 0
+    )
+    plan = ns.plan_slots(
+        catalog, NOW, _cfg(connections=2, max_markets_per_connection=1800), {0: {EV_A, EV_B}}
+    )
+    assert plan.slots == {0: {EV_A}, 1: {EV_B}}
 
 
 def test_budget_cannot_exceed_novig_cap() -> None:
     with pytest.raises(ValueError):
-        ns.RecorderConfig(max_markets=ns.MAX_WATCHED_MARKETS + 1)
+        _cfg(max_markets_per_connection=ns.MAX_WATCHED_MARKETS + 1)
 
 
 # SeqTracker
@@ -141,52 +169,69 @@ def _ev(ts: int, kind: ns.GapKind, **kw: Any) -> ns.GapEvent:
 
 def test_windows_disconnect_and_market_gap() -> None:
     events = [
-        _ev(100, "start"),
-        _ev(110, "covered"),
-        _ev(150, "seq_gap", market=MKT),
-        _ev(155, "resynced", market=MKT),
-        _ev(200, "disconnected", detail="closed 1008 SLOW_CONSUMER"),
-        _ev(205, "disconnected", detail="OSError"),  # a failed reconnect extends it
-        _ev(230, "covered"),
+        _ev(100, "start", slots=1),
+        _ev(105, "subscribed", slot=0, events=[EV_A]),
+        _ev(110, "covered", slot=0, events=[EV_A]),
+        _ev(150, "seq_gap", slot=0, market=MKT),
+        _ev(155, "resynced", slot=0, market=MKT),
+        _ev(200, "disconnected", slot=0, detail="closed 1008 SLOW_CONSUMER"),
+        _ev(205, "disconnected", slot=0, detail="OSError"),  # a failed retry extends it
+        _ev(230, "covered", slot=0, events=[EV_A]),
     ]
     windows = ns.missing_windows(events)
     assert [(w.start, w.end, w.scope, w.cause) for w in windows] == [
         (100, 110, "all", "not running"),
         (150, 155, "market", "seq gap"),
-        (200, 230, "all", "closed 1008 SLOW_CONSUMER"),
+        (200, 230, "connection", "closed 1008 SLOW_CONSUMER"),
+    ]
+    assert windows[2].events == [EV_A]
+
+
+def test_windows_one_connection_down_others_covered() -> None:
+    events = [
+        _ev(100, "start", slots=2),
+        _ev(110, "covered", slot=0, events=[EV_A]),
+        _ev(120, "covered", slot=1, events=[EV_B, EV_C]),  # all slots up: outage ends
+        _ev(200, "disconnected", slot=1, detail="closed 1006"),
+        _ev(240, "covered", slot=1, events=[EV_B, EV_C]),
+    ]
+    windows = ns.missing_windows(events)
+    assert [(w.start, w.end, w.scope, w.slot, w.events) for w in windows] == [
+        (100, 120, "all", None, None),
+        (200, 240, "connection", 1, [EV_B, EV_C]),
     ]
 
 
 def test_windows_crash_uses_last_log_line() -> None:
     events = [
-        _ev(100, "start"),
-        _ev(110, "covered"),
+        _ev(100, "start", slots=1),
+        _ev(110, "covered", slot=0),
         _ev(170, "heartbeat"),
-        _ev(400, "start"),  # no stop: the process died after 170
-        _ev(420, "covered"),
-        _ev(500, "disconnected", detail="stopped"),
+        _ev(400, "start", slots=1),  # no stop: the process died after 170
+        _ev(420, "covered", slot=0),
+        _ev(500, "disconnected", slot=0, detail="stopped"),
         _ev(501, "stop"),
     ]
     windows = ns.missing_windows(events)
-    assert [(w.start, w.end, w.cause) for w in windows] == [
-        (100, 110, "not running"),
-        (170, 420, "crash"),
-        (500, None, "stopped"),
+    assert [(w.start, w.end, w.scope, w.cause) for w in windows] == [
+        (100, 110, "all", "not running"),
+        (170, 420, "all", "crash"),
+        (500, None, "all", "stop"),
     ]
 
 
-def test_windows_open_market_gap_closes_with_connection() -> None:
+def test_windows_open_market_gap_ends_with_its_connection() -> None:
     events = [
-        _ev(100, "start"),
-        _ev(110, "covered"),
-        _ev(150, "seq_gap", market=MKT),
-        _ev(200, "disconnected", detail="x"),
+        _ev(100, "start", slots=1),
+        _ev(110, "covered", slot=0),
+        _ev(150, "seq_gap", slot=0, market=MKT),
+        _ev(200, "disconnected", slot=0, detail="x"),
     ]
     windows = ns.missing_windows(events)
     # The connection outage covers the unresolved market gap from 200 on.
     assert [(w.start, w.end, w.scope) for w in windows] == [
         (100, 110, "all"),
-        (200, None, "all"),
+        (200, None, "connection"),
     ]
 
 
@@ -277,6 +322,17 @@ def _recorded(root: Path) -> list[dict[str, Any]]:
     return lines
 
 
+def _covered_count(log: Path) -> int:
+    return log.read_text().count('"kind":"covered"') if log.exists() else 0
+
+
+async def _until_covered(log: Path, n: int) -> None:
+    while True:
+        if _covered_count(log) >= n:
+            return
+        await asyncio.sleep(0.02)
+
+
 async def test_recorder_logs_gaps_and_reconnects(tmp_path: Path) -> None:
     fake = FakeNovig()
     catalog = ns.Catalog(events=[_event(EV_A, ns.now_ms() + HOUR_MS)], market_counts={EV_A: 1})
@@ -291,19 +347,12 @@ async def test_recorder_logs_gaps_and_reconnects(tmp_path: Path) -> None:
             headers=lambda: {"Novig-Key-Id": "read-key"},
             catalog=fetch,
             root=tmp_path,
-            cfg=ns.RecorderConfig(),
+            cfg=_cfg(connections=1),
             max_backoff_s=0.2,
         )
         task = asyncio.create_task(recorder.run())
 
-        async def covered_twice() -> None:
-            while True:
-                log = tmp_path / "connections.jsonl"
-                if log.exists() and log.read_text().count('"kind":"covered"') >= 2:
-                    return
-                await asyncio.sleep(0.02)
-
-        await asyncio.wait_for(covered_twice(), 10)
+        await asyncio.wait_for(_until_covered(tmp_path / "connections.jsonl", 2), 10)
         recorder.stop()
         await asyncio.wait_for(task, 5)
 
@@ -325,8 +374,8 @@ async def test_recorder_logs_gaps_and_reconnects(tmp_path: Path) -> None:
     assert [(w.scope, w.cause) for w in windows] == [
         ("all", "not running"),
         ("market", "seq gap"),
-        ("all", "closed 1008 SLOW_CONSUMER"),
-        ("all", "stopped"),
+        ("connection", "closed 1008 SLOW_CONSUMER"),
+        ("all", "stop"),
     ]
     assert windows[2].end is not None and windows[2].end >= drop.ts
 
@@ -337,3 +386,53 @@ async def test_recorder_logs_gaps_and_reconnects(tmp_path: Path) -> None:
     assert [line["msg"].get("delta", {}).get(MKT, {}).get("book", {}).get("seq") for line in lines][
         1:3
     ] == [49, 51]
+
+
+async def test_recorder_splits_events_across_connections(tmp_path: Path) -> None:
+    subscribed: list[set[str]] = []
+
+    async def handler(ws: ServerConnection) -> None:
+        mine: set[str] = set()
+        subscribed.append(mine)
+        async for raw in ws:
+            msg = json.loads(raw)
+            events = msg.get("subscribe", {}).get("events", {})
+            mine.update(events)
+            snapshot = {
+                f"mkt-{e}": {"eventId": e, "book": {"seq": 1, "orders": {}}} for e in events
+            }
+            await ws.send(json.dumps({"nonce": msg["nonce"], "snapshot": snapshot}))
+
+    start = ns.now_ms() + HOUR_MS
+    catalog = ns.Catalog(
+        events=[_event(EV_A, start), _event(EV_B, start + 1), _event(EV_C, start + 2)],
+        market_counts={EV_A: 1000, EV_B: 1000, EV_C: 500},
+    )
+
+    async def fetch() -> ns.Catalog:
+        return catalog
+
+    async with serve(handler, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        recorder = ns.Recorder(
+            ws_url=f"ws://127.0.0.1:{port}/v3/ws",
+            headers=dict,
+            catalog=fetch,
+            root=tmp_path,
+            cfg=_cfg(connections=2, max_markets_per_connection=1800),
+        )
+        task = asyncio.create_task(recorder.run())
+        await asyncio.wait_for(_until_covered(tmp_path / "connections.jsonl", 2), 10)
+        recorder.stop()
+        await asyncio.wait_for(task, 5)
+
+    # A and B cannot share a 1800-market connection; C fits beside either.
+    assert sorted(map(sorted, subscribed)) == [[EV_A, EV_C], [EV_B]] or sorted(
+        map(sorted, subscribed)
+    ) == [[EV_A], [EV_B, EV_C]]
+    events = ns.read_gap_log(tmp_path / "connections.jsonl")
+    covered = {e.slot: e.events for e in events if e.kind == "covered"}
+    assert set(covered) == {0, 1}
+    assert sorted(e for evs in covered.values() for e in evs or []) == [EV_A, EV_B, EV_C]
+    windows = ns.missing_windows(events)
+    assert [(w.scope, w.cause) for w in windows] == [("all", "not running"), ("all", "stop")]

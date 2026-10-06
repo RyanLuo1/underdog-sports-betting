@@ -18,7 +18,6 @@ class Settings(BaseSettings):
     novig_trading_key_id: SecretStr | None = None
     novig_private_key_path: str | None = None
     apify_token: SecretStr | None = None
-    jev_api_key: SecretStr | None = None
     odds_api_key: SecretStr | None = None
 
 
