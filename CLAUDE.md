@@ -21,17 +21,20 @@ and broke imports. The launchd jobs hard-code this path, so rerun
 `src/news_edge/`:
 
 - `core/`: settings (`.env`), database connections, clock (t0 from post IDs)
-- `sources/`: news ingestion
-- `classify/`: turns posts into structured news events with a rules-based parser (the
-  only classifier)
-- `entities/`: players, teams, and their Novig market mappings
+- `sources/`: news ingestion. `apify` (actor runs, token in a header only),
+  `underdog_backfill` (weekly post backfill with a cost ledger and budget stop)
+- `classify/`: `rules` (the only classifier; versioned, never guesses), `store`
+- `entities/`: `teams` (nicknames, abbreviations, aliases), `resolver` (post to Novig
+  game and markets from the schedule, using only what was known at t0), `store`
 - `market/`: Novig data. `novig_public` and `novig_trades` (daily trade files),
   `novig_backfill` (download, Parquet, load), `novig_auth` (NOVIG-V3 signing),
-  `novig_keys` (subaccount and read key routes), `novig_stream` (order-book recorder)
+  `novig_keys` (subaccount and read key routes), `novig_stream` (order-book recorder),
+  `novig_history` (event and market names from the signed history API)
 - `pricing/`, `signal/`: fair prices and decisions
 - `execution/`: orders (shadow mode only)
 - `ledger/`: CLV ledger
-- `research/`: analysis and notebooks
+- `research/`: `stage_a` (tested logic) and `notebooks/stage_a.ipynb` (generated, committed
+  without outputs; executed results go to `docs/private/stage_a_results.ipynb`)
 - `ui/`: dashboard
 
 Also: `alembic/` (migrations), `config/default.yaml` (limits and schedules), `scripts/`
@@ -48,6 +51,18 @@ uv run alembic upgrade head              # migrate; new revision: uv run alembic
 uv run pytest                            # tests; DB tests skip if Postgres is down
 uv run ruff format . && uv run ruff check .
 uv run mypy                              # strict
+uv sync --all-groups                     # also the research group (notebook tooling)
+```
+
+Stage A pipeline, in order (each step is rerunnable):
+
+```sh
+uv run python scripts/backfill_underdog_posts.py      # posts via Apify; $10 budget ledger
+uv run python scripts/backfill_underdog_posts.py --report
+uv run python scripts/classify_posts.py               # rules parser -> classifications
+uv run python scripts/sync_novig_history.py --since 2026-07-25   # names; ~1 h (throttled)
+uv run python scripts/resolve_entities.py             # -> entity_resolutions; logs/entity-resolution.log
+uv run --group research python scripts/build_stage_a_notebook.py --run   # results -> docs/private/
 ```
 
 launchd jobs (`scripts/install_daily_jobs.sh` installs every template in
@@ -103,6 +118,10 @@ so rerunning it does not restart the recorder.
 - Never place live orders. Execution stays in shadow mode until the user says otherwise.
 - Do not build the signal engine, executor, or audit UI until Stage A results are
   reviewed and approved.
+- Never commit research results (executed notebooks, result tables) to this public repo;
+  they go in `docs/private/`.
+- Research code reports ex-post measurements (prices after the analyzed moment) only in
+  columns labeled as such, and never feeds them to signal code or point-in-time views.
 - Never delete data without asking the user first. `backup_novig_raw.py
   --delete-verified` asks before deleting, and keeps any CSV whose backup is not on
   this Mac or that has no Parquet copy. The trades job never downloads a deleted raw
@@ -116,16 +135,14 @@ Update this section at the end of each session.
 
 As of 2026-10-06:
 
-- Built: Novig trade-file backfill (17.8M rows, Aug 4 to Oct 5), NOVIG-V3 signing,
-  read key script, and the order-book recorder (4 connections, gap log).
-- Running: `novig-recorder` on Production (4 connections), `novig-trades` (twice
-  daily), `novig-backup` (nightly to iCloud Drive). Disk was 89% used (26 GiB free) on
-  Oct 6; watch the disk line in `logs/novig-backup.log`.
-- Next, in order (see the Plan section of `docs/private/spec.md`):
-  1. Recorder on Production: running since Oct 6. Check its gap log after the first
-     NFL Sunday.
-  2. Stage A as a research notebook in `src/news_edge/research/notebooks/`, not a
-     service: @UnderdogNFL posts since Aug 4 (Apify backfill) joined to `novig_trades`.
-     The method is in the spec, not here.
-  3. Go/no-go from Stage A results, decided by the user.
-  4. Only on a go: the signal engine, executor (shadow mode), and audit UI.
+- Built: Novig trade-file backfill; order-book recorder (4 connections, gap log, disk
+  guard); nightly backups to iCloud Drive; @UnderdogNFL post backfill (Aug 4 to Oct 6,
+  3,158 posts, $4.43 of the $10 Apify budget); rules classifier; schedule-based entity
+  resolution; Novig event and market names (history API); Stage A notebook.
+- Running: `novig-recorder` on Production, `novig-trades` (twice daily),
+  `novig-backup` (nightly). Disk was 89% used (27 GiB free) on Oct 6.
+- Known data gap: no posts on Aug 31 (ET) in two separate fetches; unverified.
+- Next, in order (see the Plan in `docs/private/spec.md`):
+  1. Review Stage A results (`docs/private/stage_a_results.ipynb`) with the user.
+  2. Go/no-go from Stage A, decided by the user.
+  3. Only on a go: the signal engine, executor (shadow mode), and audit UI.
