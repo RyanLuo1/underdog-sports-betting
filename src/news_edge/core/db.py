@@ -15,4 +15,5 @@ def libpq_url(database_url: str) -> str:
 def connect(database_url: str | None = None) -> psycopg.Connection:
     """Open an autocommit connection; group statements with `conn.transaction()`."""
     url = database_url or get_settings().database_url
-    return psycopg.connect(libpq_url(url), autocommit=True)
+    # UTC session: timestamptz values come back in UTC whatever the server's setting.
+    return psycopg.connect(libpq_url(url), autocommit=True, options="-c TimeZone=UTC")

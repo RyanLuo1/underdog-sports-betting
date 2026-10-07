@@ -41,3 +41,15 @@ backup:
   dest: "~/Library/Mobile Documents/com~apple~CloudDocs/novig-backups"
   warn_free_gib: 20        # disk line says WARNING and sends a notification below this
   critical_free_gib: 10    # CRITICAL, with a notification
+
+# One-off backfill of news posts through Apify (scripts/backfill_underdog_posts.py).
+# Apify's tweet-scraper is for historical backfill only: no monitoring, at least 50
+# tweets per query, one run at a time.
+underdog_backfill:
+  account: UnderdogNFL
+  start: 2026-08-04
+  actor: apidojo/tweet-scraper
+  sort: "Latest + Top"
+  max_items_per_week: 2500   # maxItems on every run; also caps each run's charge
+  budget_usd: 10             # stop before total spend in the run ledger passes this
+  event_price_usd: 0.0004    # per tweet; used only if a run omits its pricing

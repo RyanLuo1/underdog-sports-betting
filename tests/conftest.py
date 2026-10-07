@@ -39,5 +39,8 @@ def db_url() -> Iterator[str]:
 @pytest.fixture
 def db(db_url: str) -> Iterator[psycopg.Connection]:
     with connect(db_url) as conn:
-        conn.execute("TRUNCATE novig_trades, novig_trade_files")
+        conn.execute(
+            "TRUNCATE novig_trades, novig_trade_files, entity_resolutions, classifications,"
+            " posts, novig_markets, novig_events"
+        )
         yield conn
